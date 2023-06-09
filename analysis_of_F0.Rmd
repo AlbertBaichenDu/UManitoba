@@ -1,0 +1,305 @@
+---
+title: "Analysis of F0 data"
+author: "Albert Baichen Du"
+date: "2022-08-13"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_folding: hide
+    theme: cerulean
+  pdf_document:
+    toc: yes
+---
+
+# Library
+```{r setup, include = TRUE, warning = FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  comment = "#>"
+)
+library(knitr)
+library(tidyverse)
+library(here)
+library(broom)
+library(broom.mixed)
+library(writexl)
+library(ggpubr)
+library(gghighlight)
+library(lme4)
+library(lmerTest)
+library(fs)
+library(stringr)
+library(lubridate)
+```
+
+## Read all data
+```{r}
+all_results <- dir_ls(here("results"))
+smartphone_android <- dir_ls(here("smartphone_data"), regexp = "^.*QT.*")
+smartphone_iphone <- dir_ls(here("smartphone_data"), regexp = "^.*RD.*")
+ADEX_all <- dir_ls(here("adex_data"))
+```
+
+## Set up functions to clean the data
+```{r}
+read_F0 <- function(csvfile){
+  
+  raw_data <- read_csv(csvfile, col_names = TRUE) %>% 
+    slice(-1) %>% 
+    mutate(
+      usability = recode(usability, "0." = "good"),
+      xds = recode(xds, "0." = "C")) %>% 
+    select(-F0_100) %>% 
+    mutate(participant = str_extract(file_name, "\\d+")) %>% 
+    relocate(participant, .before = file_name)
+}
+
+read_android <- function(csvfile){
+  raw_data <- read_csv(csvfile, col_names = TRUE) %>% 
+    mutate(participant = csvfile) %>% 
+    mutate(participant = 
+    str_extract_all(participant, "\\d+")) %>%
+    mutate(system = "android")
+}
+
+read_iphone <- function(csvfile){
+  raw_data <- read_csv(csvfile, col_names = TRUE) %>% 
+    mutate(participant = csvfile) %>% 
+    mutate(participant = 
+             str_extract_all(participant, "\\d+")) %>%
+    mutate(system = "iphone") %>% 
+    mutate(start_time = as.character(start_time),
+           end_time = as.character(end_time))
+}
+
+read_adex <- function(csvfile){
+  raw_data <- read_csv(csvfile, col_names = TRUE) %>% 
+    mutate(initial_time = Clock_Time_TZAdj[1]) %>% 
+    mutate(participant = File_Name) %>% 
+    separate(participant, into = c('participant', 'suffix'), sep = "_") %>% 
+    select(-suffix) %>% 
+    select(initial_time, participant) %>% 
+    unique()  %>% 
+    mutate(initial_time = mdy_hms(initial_time),
+      year = year(initial_time),
+      month = month(initial_time),
+      day = day(initial_time)) %>% 
+    mutate(initial_time = as.character(initial_time),
+           participant = as.numeric(participant))
+}
+
+```
+
+## Execute the functions with respective data
+```{r, warning = FALSE, message=FALSE}
+F0 <- purrr::map_dfr(all_results, read_F0)
+
+smartphone_android_data <- purrr::map_dfr(smartphone_android, read_android)
+
+smartphone_iphone_data <- purrr::map_dfr(smartphone_iphone, read_iphone)
+
+smartphone_all <- rbind(smartphone_android_data, smartphone_iphone_data) %>% 
+  mutate(participant = as.numeric(participant))
+
+ADEX_all_data <- purrr::map_dfr(ADEX_all, read_adex)
+```
+
+## Add timestamp for F0 data
+```{r}
+F0_with_time <- F0 %>% 
+  mutate(participant = as.numeric(participant)) %>% 
+  left_join(ADEX_all_data, by = 'participant') %>% 
+  relocate(initial_time, .before = speaker) %>% 
+  mutate(initial_time = ymd_hms(initial_time)) %>% 
+  mutate(interval_start_time = initial_time + interval_start,
+         interval_end_time = initial_time + interval_end) %>% 
+  relocate(c("interval_start_time", "interval_end_time"), .before = speaker) %>% 
+  mutate(initial_time = as.character(initial_time)) 
+```
+
+## Add timestamp for smartphone usage data
+```{r}
+smartphone_usage <- ADEX_all_data %>% 
+  right_join(smartphone_all, by = "participant")
+
+smartphone_usage_android <- smartphone_usage %>% 
+  filter(system == "android") %>% 
+  mutate(start_time = paste0(year, "-", start_time),
+         end_time = paste0(year, "-", end_time)) %>% 
+  mutate(tz = case_when(
+    year == 2020 & month <= 10 ~ "Etc/GMT-5",
+    year == 2020 & month > 10 ~ "Etc/GMT-6",
+    year == 2021 & month <= 2 ~ "Etc/GMT-6",
+    year == 2021 & month == 3 & day < 14 ~ "Etc/GMT-6",
+    year == 2021 & month == 3 & day >= 14 ~ "Etc/GMT-5",
+    year == 2021 & month >= 4 & month <= 10  ~ "Etc/GMT-5",
+    year == 2021 & month == 11 & day <= 6 ~ "Etc/GMT-5",
+    year == 2021 & month == 11 & day >= 7 ~ "Etc/GMT-6")) 
+
+smartphone_usage_android_GMT5 <- smartphone_usage_android %>% 
+  filter(tz == "Etc/GMT-5") %>% 
+  mutate(start_time = parse_date_time(start_time, '%Y-%d-%m %H:%M:%p', tz = "Etc/GMT-5"),
+         end_time = parse_date_time(end_time, '%Y-%d-%m %H:%M:%p', tz = "Etc/GMT-5"))
+
+smartphone_usage_android_GMT6 <- smartphone_usage_android %>% 
+  filter(tz == "Etc/GMT-6") %>% 
+  mutate(start_time = parse_date_time(start_time, '%Y-%d-%m %H:%M:%p', tz = "Etc/GMT-6"),
+         end_time = parse_date_time(end_time, '%Y-%d-%m %H:%M:%p', tz = "Etc/GMT-6"))
+
+smartphone_usage_android <- smartphone_usage_android_GMT5 %>% 
+  rbind(smartphone_usage_android_GMT6) %>% 
+  select(-tz)
+
+smartphone_usage_iphone <- smartphone_usage %>% 
+  filter(system == "iphone")
+
+smartphone_usage_all <- smartphone_usage_android %>% 
+  rbind(smartphone_usage_iphone)
+```
+
+## Remove some intermediate data
+```{r}
+rm(smartphone_usage_android)
+rm(smartphone_usage_iphone)
+rm(smartphone_usage_android_GMT5)
+rm(smartphone_usage_android_GMT6)
+rm(smartphone_usage)
+rm(smartphone_android_data)
+rm(smartphone_iphone_data)
+rm(smartphone_all)
+```
+
+## Merge F0 and smartphone usage data
+```{r}
+meta <- F0_with_time %>% 
+  left_join(smartphone_usage_all, by = c('participant', 'initial_time', 'year', 'month', 'day')) %>% 
+  mutate(interval_start_time = as.character(interval_start_time),
+         interval_end_time = as.character(interval_end_time),
+         start_time = as.character(start_time),
+          end_time = as.character(end_time)) %>% 
+  mutate(
+    match = ifelse(interval_start_time >= start_time & interval_end_time <= end_time, "match", "unmatch")
+  ) %>% 
+  relocate(c("year", "month", "day", "system", "match"), .before = speaker)
+```
+
+## Preliminary processing of matching between F0 and phone use
+```{r}
+meta_unmatch <- meta %>% 
+  filter(match == "unmatch") %>% 
+  select(-start_time, -end_time) %>% 
+  mutate(duration = 0) %>% 
+  unique() %>% 
+  mutate(usage = "not_using")
+
+meta_match <- meta %>% 
+  filter(match == "match") %>% 
+  select(-start_time, -end_time) %>% 
+  unique() %>% 
+  mutate(usage = "using")
+
+meta <- meta_match %>% 
+  rbind(meta_unmatch) %>% 
+  mutate(usage_percent = duration/300) %>% 
+  filter(!pitch_mean == "--undefined-- Hz") %>% 
+  mutate(pitch_mean = as.numeric(str_remove_all(pitch_mean, " Hz")),
+         pitch_min = as.numeric(str_remove_all(pitch_min, " Hz")),
+         pitch_max = as.numeric(str_remove_all(pitch_max, " Hz")),
+         pitch_sd = as.numeric(str_remove_all(pitch_sd, " Hz")))
+
+```
+
+## Descriptive Statistics and plots
+### Preparation of summary statistics
+```{r}
+F0_summary <- meta %>% 
+  group_by(usage) %>% 
+  summarise(mean = mean(pitch_mean),
+            min = min(pitch_min),
+            max = max(pitch_max),
+            n = length(pitch_mean),
+            sd = sd(pitch_mean),
+            se_pitch_mean = sd / sqrt(n),
+            t_pitch_mean = qt((0.95)/2 + .5, n - 1), 
+            cimin_pitch_mean = mean - t_pitch_mean * se_pitch_mean,
+            cimax_pitch_mean = mean + t_pitch_mean * se_pitch_mean)
+
+F0_summary_by_participant <- meta %>% 
+  group_by(usage, participant) %>% 
+  summarise(mean = mean(pitch_mean),
+            min = min(pitch_min),
+            max = max(pitch_max),
+            n = length(pitch_mean),
+            sd = sd(pitch_mean),
+            se_pitch_mean = sd / sqrt(n),
+            t_pitch_mean = qt((0.95)/2 + .5, n - 1), 
+            cimin_pitch_mean = mean - t_pitch_mean * se_pitch_mean,
+            cimax_pitch_mean = mean + t_pitch_mean * se_pitch_mean)
+
+```
+
+### Barplot with error bar
+```{r}
+F0_bar <- F0_summary %>% 
+  ggplot()+
+  geom_col(aes(x = usage, y = mean, fill = usage, color = usage), width = 0.4)+
+  geom_errorbar(aes(x = usage, ymin = cimin_pitch_mean, ymax = cimax_pitch_mean), width = 0.2)+
+  theme_pubclean()+
+  labs(
+    title = "Global Comparison of F0 When Using and not Using Cell Phones"
+  )+
+  theme(aspect.ratio = 3/4,
+        legend.position = "right",
+        plot.title = element_text(size = 13,
+                                  face = "bold",
+                                  hjust = 0.5), # adjust the plot title
+        plot.subtitle = element_text(size = 15,
+                                  hjust = 0.5),
+        axis.title.x = element_text(size = 15,
+                                    hjust = 0.5), # adjust the x-axis title 
+        axis.title.y = element_text(size = 15,
+                                    vjust = 0.5), # adjust the y-axis title
+        axis.text.x = element_text(size = 12,
+                                    hjust = 0.5), # adjust the x-axis labels
+        axis.text.y = element_text(size = 10,
+                                   vjust = 0.5), # adjust the  y-axis labels
+        axis.ticks.x = element_blank() # removing the x-axis tick lines
+  )
+F0_bar
+```
+
+### Correlation between percent of usage and F0
+There are so few data points now. Probably we can do this after all recordings are annotated.
+```{r}
+F0_scatter <- meta %>% 
+  ggplot(aes(x = pitch_mean, y = usage_percent))+
+  geom_point()+
+  geom_smooth(method = "lm")+theme_pubclean()+
+  labs(
+    title = "Scatterplot of pitch mean against usage percent of smartphone"
+  )
+
+F0_scatter
+```
+
+## Inferential Statistics
+### T-test
+Number of samples is different. Paired T-test within participant might not be useful. So I did cross-participant paired t-test. For now, there is not enough data points to do this, but we will see it later.
+```{r}
+F0_summary_by_participant_using <- F0_summary_by_participant %>% 
+  filter(usage == "using")
+
+F0_summary_by_participant_notusing <- F0_summary_by_participant %>% 
+  filter(usage == "not_using")
+
+F0_ttest <- t.test(F0_summary_by_participant_using$mean, F0_summary_by_participant_notusing$mean)
+
+```
+
+### Mixed Effects Linear Model - Full Interaction
+```{r}
+lm_1 <- lmer(pitch_mean ~ xds * usage * Child_Age * Child_Gender + (1|participant), data = meta)
+summary(lm_1)
+```
